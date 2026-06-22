@@ -1,0 +1,91 @@
+# DDMediStock — local / single-host production stack.
+#   docker compose up --build
+#
+# Services: app (Next.js), db (PostgreSQL 16 + pgvector), redis.
+# The db image ships the pgvector extension; pg_trgm is bundled with Postgres.
+# Extensions are created by Prisma migrations on first `migrate deploy`.
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ddmedistock
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ddmedistock}
+      POSTGRES_DB: ddmedistock
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ddmedistock -d ddmedistock"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://ddmedistock:${POSTGRES_PASSWORD:-ddmedistock}@db:5432/ddmedistock?schema=public"
+      REDIS_URL: "redis://redis:6379"
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    # Apply migrations, then start the standalone server.
+    command: ["sh", "-c", "npx prisma migrate deploy && node server.js"]
+
+  # BullMQ worker — processes RFQ/OCR/AI/quotation/notification/email queues.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://ddmedistock:${POSTGRES_PASSWORD:-ddmedistock}@db:5432/ddmedistock?schema=public"
+      REDIS_URL: "redis://redis:6379"
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      NODE_ENV: production
+    # NOTE: the production "runner" stage ships Next.js standalone output and
+    # does NOT include tsx or the raw src/ tree, so it cannot run worker.ts as
+    # written. Options: (a) add a dedicated worker build stage that keeps
+    # node_modules + src and runs `npx tsx worker.ts`, or (b) compile worker.ts
+    # to JS. Locally, run the worker with `npm run worker`. This service is
+    # provided as the deployment shape; wire it to a worker-capable image.
+    command: ["npm", "run", "worker"]
+
+volumes:
+  db_data:
+  redis_data:

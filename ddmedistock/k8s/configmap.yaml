@@ -1,0 +1,13 @@
+# Non-secret runtime configuration. Secrets (DB URL, JWT, OpenAI key) live in
+# the Secret manifest, not here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ddmedistock-config
+  namespace: ddmedistock
+data:
+  NODE_ENV: "production"
+  PORT: "3000"
+  NEXT_TELEMETRY_DISABLED: "1"
+  OPENAI_MODEL: "gpt-4o-mini"
+  REDIS_URL: "redis://ddmedistock-redis:6379"

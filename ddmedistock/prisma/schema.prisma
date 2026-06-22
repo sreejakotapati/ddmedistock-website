@@ -1,0 +1,272 @@
+// DDMediStock — AI-Powered Medical Procurement & RFQ Management Platform
+// Datasource: PostgreSQL 16 with the pgvector and pg_trgm extensions.
+//   - pgvector powers semantic similarity search over product embeddings.
+//   - pg_trgm powers trigram fuzzy text search over product names/searchText.
+// Enum-like fields are stored as String with constants in src/lib/constants.ts.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector, pg_trgm]
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  type      String   @default("HOSPITAL") // HOSPITAL | CLINIC | LAB | OTHER
+  gstin     String?
+  address   String?
+  phone     String?
+  createdAt DateTime @default(now())
+  deletedAt DateTime? // soft delete — null = active
+
+  users User[]
+  rfqs  RFQ[]
+
+  @@index([deletedAt])
+}
+
+model User {
+  id             String   @id @default(cuid())
+  email          String   @unique
+  passwordHash   String
+  name           String
+  role           String   @default("CUSTOMER") // CUSTOMER | ADMIN | VENDOR
+  organizationId String?
+  vendorId       String?
+  createdAt      DateTime @default(now())
+  deletedAt      DateTime? // soft delete — null = active
+
+  organization  Organization?  @relation(fields: [organizationId], references: [id])
+  vendor        Vendor?        @relation(fields: [vendorId], references: [id])
+  rfqs          RFQ[]
+  notifications Notification[]
+  auditLogs     AuditLog[]
+}
+
+model Vendor {
+  id          String   @id @default(cuid())
+  name        String
+  email       String?  @unique
+  originType  String   @default("DOMESTIC") // DOMESTIC | IMPORTED
+  status      String   @default("PENDING")  // PENDING | APPROVED | SUSPENDED
+  cdscoLicense String?
+  isoCert      String?
+  importCert   String?
+  createdAt   DateTime @default(now())
+  deletedAt   DateTime? // soft delete — null = active
+
+  users          User[]
+  vendorProducts VendorProduct[]
+
+  @@index([deletedAt])
+}
+
+model Category {
+  id       String    @id @default(cuid())
+  name     String    @unique
+  products Product[]
+}
+
+model Product {
+  id          String   @id @default(cuid())
+  name        String
+  brand       String?
+  description String?
+  uom         String   @default("Unit") // unit of measure
+  hsnCode     String?
+  originType  String   @default("DOMESTIC") // DOMESTIC | IMPORTED
+  // searchText is a denormalized lowercase blob used by the in-app hybrid
+  // matching engine (stands in for a pgvector embedding column in prod).
+  searchText  String   @default("")
+  // embedding holds a JSON-encoded float[] from OpenAI embeddings (portable,
+  // provider-agnostic). A parallel native pgvector `embedding_vec vector(1536)`
+  // column — added in the pgvector_trgm_indexes migration and backed by an HNSW
+  // ANN index — powers fast semantic search; catalog-ai.ts keeps both in sync.
+  embedding   String?
+  active      Boolean  @default(true)
+  categoryId  String?
+  createdAt   DateTime @default(now())
+  deletedAt   DateTime? // soft delete — null = active
+
+  category       Category?          @relation(fields: [categoryId], references: [id])
+  attributes     ProductAttribute[]
+  vendorProducts VendorProduct[]
+  matches        ProductMatch[]
+  quotationItems QuotationItem[]
+
+  @@index([deletedAt])
+  @@index([categoryId])
+}
+
+model ProductAttribute {
+  id        String  @id @default(cuid())
+  productId String
+  key       String
+  value     String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+model VendorProduct {
+  id           String  @id @default(cuid())
+  vendorId     String
+  productId    String
+  sku          String?
+  stock        Int     @default(0)
+  leadTimeDays Int     @default(7)
+
+  vendor  Vendor       @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  product Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  costs   VendorCost[]
+
+  @@unique([vendorId, productId])
+}
+
+// Internal cost data — NEVER exposed to customers.
+model VendorCost {
+  id              String   @id @default(cuid())
+  vendorProductId String
+  cost            Float
+  currency        String   @default("INR")
+  validFrom       DateTime @default(now())
+  vendorProduct   VendorProduct @relation(fields: [vendorProductId], references: [id], onDelete: Cascade)
+}
+
+// Internal margin engine — NEVER exposed to customers.
+model MarginRule {
+  id         String  @id @default(cuid())
+  name       String
+  originType String? // DOMESTIC | IMPORTED | null = any
+  categoryId String?
+  markupPct  Float   @default(20)
+  active     Boolean @default(true)
+}
+
+model RFQ {
+  id             String   @id @default(cuid())
+  reference      String   @unique
+  title          String
+  status         String   @default("UNDER_REVIEW")
+  // UNDER_REVIEW | MATCHING_COMPLETED | QUOTATION_IN_PROGRESS | QUOTATION_UPLOADED | APPROVED | REJECTED
+  sourceType     String   @default("TEXT") // PDF | EXCEL | CSV | IMAGE | TEXT
+  sourceFileName String?
+  rawText        String   @default("")
+  organizationId String
+  createdById    String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  createdBy    User          @relation(fields: [createdById], references: [id])
+  lineItems    RFQLineItem[]
+  quotations   Quotation[]
+}
+
+model RFQLineItem {
+  id           String  @id @default(cuid())
+  rfqId        String
+  lineNo       Int
+  rawText      String
+  productName  String
+  brand        String?
+  quantity     Float   @default(1)
+  unit         String  @default("Unit")
+  attributes   Json
+  createdAt    DateTime @default(now())
+
+  rfq     RFQ            @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  matches ProductMatch[]
+}
+
+model ProductMatch {
+  id         String  @id @default(cuid())
+  lineItemId String
+  productId  String
+  score      Float   @default(0)
+  matchType  String  @default("HYBRID") // ATTRIBUTE | FUZZY | SEMANTIC | HYBRID
+  rank       Int     @default(0)
+  isSelected Boolean @default(false)
+  reason     String  @default("")
+
+  lineItem RFQLineItem @relation(fields: [lineItemId], references: [id], onDelete: Cascade)
+  product  Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+model Quotation {
+  id            String   @id @default(cuid())
+  number        String   @unique
+  rfqId         String
+  status        String   @default("DRAFT") // DRAFT | PENDING_APPROVAL | PUBLISHED
+  currency      String   @default("INR")
+  customerNotes String   @default("") // visible to customer
+  internalNotes String   @default("") // admin-only
+  taxPct        Float    @default(12)
+  version       Int      @default(1)
+  publishedAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  rfq      RFQ                @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  items    QuotationItem[]
+  versions QuotationVersion[]
+}
+
+model QuotationItem {
+  id           String  @id @default(cuid())
+  quotationId  String
+  productId    String?
+  description  String
+  quantity     Float   @default(1)
+  unit         String  @default("Unit")
+  unitCost     Float   @default(0) // internal, admin-only
+  marginPct    Float   @default(20) // internal, admin-only
+  unitPrice    Float   @default(0) // customer-facing price
+  taxPct       Float   @default(12)
+  leadTimeDays Int     @default(7)
+  originType   String  @default("DOMESTIC")
+  vendorName   String? // internal sourcing info
+  internalNote String  @default("")
+  sortOrder    Int     @default(0)
+
+  quotation Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  product   Product?  @relation(fields: [productId], references: [id])
+}
+
+model QuotationVersion {
+  id          String   @id @default(cuid())
+  quotationId String
+  version     Int
+  snapshot    Json
+  note        String   @default("")
+  createdById String?
+  createdAt   DateTime @default(now())
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String   @default("INFO")
+  title     String
+  body      String   @default("")
+  link      String?
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String
+  entity    String
+  entityId  String?
+  meta      Json
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id])
+}
